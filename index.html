@@ -57,14 +57,12 @@
     <option value="polygon">polygon</option>
   </select>
   </div>
-<button onclick="shareGrid()">שתף רשת</button>
   </div>
   
   <div class="canvasWrap">
     <canvas id="c"></canvas>
   </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/d3-delaunay@6"></script>
 <script>
 // Interactive physics grid implemented with Verlet integration and distance constraints (springs)
@@ -356,71 +354,6 @@ window.addEventListener('keydown',(e)=>{
   if(e.key.toLowerCase()==='c'){ setMode('connect'); }
   if(e.key.toLowerCase()==='d'){ setMode('delete'); }
 });
-// שמירה מלאה של כל מצב הרשת כולל מוד, עם בדיקה שמונעת שגיאות// שמירה מלאה של כל מצב הרשת כולל מוד
-function exportFullState(points = [], sticks = [], globals = {}) {
-    const params = {
-        pts: points.map(p => [p.x, p.y, p.oldx, p.oldy, p.pinned ? 1 : 0, p.color, p.size]),
-        stk: sticks.map(s => [s.a, s.b, s.length, s.color, s.hidden ? 1 : 0]),
-        glb: {
-            gravity: globals.gravity || 0,
-            friction: globals.friction || 0,
-            iterations: globals.iterations || 1,
-            windX: globals.windX || 0,
-            windY: globals.windY || 0,
-            width: globals.width || window.innerWidth,
-            height: globals.height || window.innerHeight,
-            mode: globals.mode || "default"
-        }
-    };
-    const json = JSON.stringify(params);
-    return btoa(unescape(encodeURIComponent(json)));
-}
-
-// טעינת כל מצב מהרשת כולל מוד
-function importFullState(encoded) {
-    if (!encoded) return;
-    try {
-        const json = decodeURIComponent(escape(atob(encoded)));
-        const state = JSON.parse(json);
-
-        points = (state.pts || []).map(p => ({
-            x: p[0], y: p[1], oldx: p[2], oldy: p[3], pinned: !!p[4], color: p[5], size: p[6]
-        }));
-        sticks = (state.stk || []).map(s => ({
-            a: s[0], b: s[1], length: s[2], color: s[3], hidden: !!s[4]
-        }));
-        const g = state.glb || {};
-        window.gravity = g.gravity || 0;
-        window.friction = g.friction || 0;
-        window.iterations = g.iterations || 1;
-        window.windX = g.windX || 0;
-        window.windY = g.windY || 0;
-        window.width = g.width || window.innerWidth;
-        window.height = g.height || window.innerHeight;
-        window.mode = g.mode || "normal";
-    } catch(e) {
-        console.error("Error decoding state:", e);
-    }
-}
-
-// יצירת URL אוטומטית והעתקה ללוח
-function shareGrid(points, sticks, globals) {
-    const encoded = exportFullState(points, sticks, globals);
-    const url = `${location.origin}${location.pathname}?data=${encoded}`;
-    navigator.clipboard.writeText(url).catch(()=>{});
-    return url;
-}
-
-// טעינת מצב מה-URL אוטומטית
-function loadFromURL() {
-    const urlParams = new URLSearchParams(location.search);
-    const encoded = urlParams.get("data");
-    if (encoded) importFullState(encoded);
-}
-
-
-
-window.addEventListener('load', loadFromURL);
 </script>
 </body>
 </html>
