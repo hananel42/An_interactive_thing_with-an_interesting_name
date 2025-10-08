@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="he">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>An interactive thing with an interesting name</title>
+<style>
+  :root{--bg:#0b1020;--line:#7fb3ff;--node:#dff3ff;--pin:#ffd36b}
+  html,body{height:100%;margin:0;background:var(--bg);color:#e6eef8;font-family:system-ui,Segoe UI,Roboto,Arial}
+  .wrap{display:flex;gap:16px;padding:18px}
+  .ui{width:320px}
+  .canvasWrap{flex:1;border-radius:10px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  canvas{display:block;width:100%;height:80vh;background:linear-gradient(180deg,#051026 0%, #081223 100%);cursor:grab}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+  label{font-size:13px;color:#cfe6ff}
+  input[type=range]{width:100%}
+  button{background:#13203a;color:#e8f5ff;border:1px solid rgba(255,255,255,0.06);padding:8px;border-radius:8px;cursor:pointer}
+  .small{font-size:12px;color:#bcd7ff}
+  .footer{margin-top:12px;font-size:12px;color:#9fbff0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="ui">
+    <h3>An interactive thing with an interesting name</h3>
+    <div class="row"><label>גודל רשת</label></div>
+    <div class="row"><label class="small">שורות</label><input id="rows" type="number" min="4" max="80" value="20"></div>
+    <div class="row"><label class="small">עמודות</label><input id="cols" type="number" min="4" max="80" value="28"></div>
+    <div class="row"><label class="small">רוחב ריתוך</label><input id="spacing" type="range" min="6" max="40" value="18"></div>
+    <div class="row"><label class="small">כוח גרביטציה</label><input id="gravity" type="range" min="-2" max="6" step="0.1" value="1"></div>
+    <div class="row"><label class="small">דאמפינג (0-1)</label><input id="damping" type="range" min="0" max="0.999" step="0.001" value="0.995"></div>
+    <div class="row"><label class="small">איטרציות קונסטריינט</label><input id="iter" type="range" min="1" max="10" value="5"></div>
+    <div class="row"><label class="small">אורך מקסימלי לפריצת קפיץ</label><input id="tear" type="range" min="1" max="20" step="0.01" value="20.0"></div>
+	
+	<button id="mode-drag">גרירה (Space)</button>
+	<button id="mode-add">הוספה (A)</button>
+    <button id="mode-connect">חיבור (C)</button>
+    <button id="mode-delete">מחיקה (D)</button>
+    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+      <button id="reset">Reset</button>
+      <button id="pinAll">Pin Top Row</button>
+      <button id="unpinAll">Unpin All</button>
+      <button id="toggleSim">Pause</button>
+    </div>
+	<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+      <button id="save">שמור JSON</button>
+      <button id="loadBtn">טען JSON</button>
+      <input id="file" type="file" style="display:none">
+    </div>
+
+    <div class="footer">לחץ וגרור נקודה כדי להזיז; לחץ עם Ctrl כדי לקבע/לשחרר נקודה; גרור בדופק להחיל כוח.</div>
+    <div class="row">
+  <label>מצב רשת:</label>
+  <select id="modeSelect">
+    <option value="normal">Normal</option>
+    <option value="delaunay">Delaunay</option>
+    <option value="polygon">polygon</option>
+  </select>
+</div>
+
+  </div>
+  
+  <div class="canvasWrap">
+    <canvas id="c"></canvas>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/d3-delaunay@6"></script>
+<script>
+// Interactive physics grid implemented with Verlet integration and distance constraints (springs)
+// - Click+drag: move points
+// - Ctrl+click: toggle pin (fixed)
+// - UI controls to tune grid and physics
+let renderMode = 'normal'; // ברירת מחדל
+
+const modeSelect = document.getElementById('modeSelect');
+modeSelect.addEventListener('change', e => {
+  renderMode = e.target.value;
+});
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let DPR = window.devicePixelRatio || 1;
+let mode='drag';
+function resizeCanvas(){
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.floor(rect.width * DPR);
+  canvas.height = Math.floor(rect.height * DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize', resizeCanvas, {passive:true});
+resizeCanvas();
+
+// Data structures
+class Point{
+  constructor(x,y){ this.x=x; this.y=y; this.px=x; this.py=y; this.ax=0; this.ay=0; this.pinned=false; }
+  applyForce(fx,fy){ this.ax += fx; this.ay += fy; }
+  verlet(dt, damping){ if(this.pinned) { this.px = this.x; this.py = this.y; this.ax = 0; this.ay = 0; return; }
+    const nx = this.x + (this.x - this.px) * damping + this.ax * dt * dt;
+    const ny = this.y + (this.y - this.py) * damping + this.ay * dt * dt;
+    this.px = this.x; this.py = this.y; this.x = nx; this.y = ny; this.ax=0; this.ay=0;
+  }
+}
+
+class Stick{ // distance constraint between two points
+  constructor(a,b,length,tearFactor=2){ this.a=a; this.b=b; this.length=length; this.tear=tearFactor; this.broken=false; }
+  satisfy(){ if(this.broken) return;
+    const dx = this.b.x - this.a.x; const dy = this.b.y - this.a.y; const dist = Math.hypot(dx,dy);
+    if(dist === 0) return;
+    if(dist > this.length * this.tear && this.tear !=20) { this.broken = true; return; }
+    const diff = (this.length - dist)/dist;
+    const invMassA = this.a.pinned ? 0 : 1;
+    const invMassB = this.b.pinned ? 0 : 1;
+    const sum = invMassA + invMassB;
+    if(sum === 0) return;
+    const mul = 0.5 * diff;
+    const ax = dx * mul; const ay = dy * mul;
+    if(!this.a.pinned){ this.a.x -= ax * (invMassA / sum); this.a.y -= ay * (invMassA / sum); }
+    if(!this.b.pinned){ this.b.x += ax * (invMassB / sum); this.b.y += ay * (invMassB / sum); }
+  }
+}
+
+let points = [];
+let sticks = [];
+let rows = 20, cols = 28, spacing = 18;
+let gravity = 1.0, damping = 0.995, iter = 5, tearFactor = 20.0;
+let running = true;
+let connectFrom = null;
+document.getElementById('mode-drag').addEventListener('click', ()=> setMode('drag'));
+document.getElementById('mode-add').addEventListener('click', ()=> setMode('add'));
+document.getElementById('mode-connect').addEventListener('click', ()=> setMode('connect'));
+document.getElementById('mode-delete').addEventListener('click', ()=> setMode('delete'));
+
+function setMode(m){ mode=m; document.querySelectorAll('.modes button, .modes').forEach(b=>{}); document.querySelectorAll('.modes button').forEach(btn=>btn.style.opacity=btn.id==='mode-'+m? '1':'0.7'); }
+setMode('drag');
+
+function findNearest(x,y,maxd){ let best=null; let bd=maxd; for(const p of points){ const d=Math.hypot(p.x-x,p.y-y); if(d<bd){ bd=d; best=p; } } return best; }
+function buildGrid(r,c,s){ points=[]; sticks=[];
+  rows=r; cols=c; spacing=s;
+  const offsetX = Math.max(80, (canvas.width/DPR - (cols-1)*spacing)/2);
+  const offsetY = 60;
+  for(let y=0;y<rows;y++){
+    for(let x=0;x<cols;x++){
+      const px = offsetX + x * spacing;
+      const py = offsetY + y * spacing;
+      points.push(new Point(px,py));
+    }
+  }
+  function idx(x,y){ return y*cols + x; }
+  // create structural sticks
+  for(let y=0;y<rows;y++){
+    for(let x=0;x<cols;x++){
+      const p = points[idx(x,y)];
+      if(x<cols-1){ const q = points[idx(x+1,y)]; sticks.push(new Stick(p,q,spacing,tearFactor)); }
+      if(y<rows-1){ const q = points[idx(x,y+1)]; sticks.push(new Stick(p,q,spacing,tearFactor)); }
+      // optional diagonal springs for stiffness
+      if(x<cols-1 && y<rows-1){ sticks.push(new Stick(p, points[idx(x+1,y+1)], spacing*Math.SQRT2,tearFactor)); }
+      if(x>0 && y<rows-1){ sticks.push(new Stick(p, points[idx(x-1,y+1)], spacing*Math.SQRT2,tearFactor)); }
+    }
+  }
+}
+
+// initial build
+buildGrid(rows,cols,spacing);
+
+// UI bindings
+const rowsEl = document.getElementById('rows');
+const colsEl = document.getElementById('cols');
+const spacingEl = document.getElementById('spacing');
+const gravityEl = document.getElementById('gravity');
+const dampingEl = document.getElementById('damping');
+const iterEl = document.getElementById('iter');
+const tearEl = document.getElementById('tear');
+const resetBtn = document.getElementById('reset');
+const pinAllBtn = document.getElementById('pinAll');
+const unpinAllBtn = document.getElementById('unpinAll');
+const toggleBtn = document.getElementById('toggleSim');
+const fileInput = document.getElementById('file'); document.getElementById('loadBtn').addEventListener('click', ()=> fileInput.click());
+rowsEl.value = rows; colsEl.value = cols; spacingEl.value = spacing; gravityEl.value = gravity; dampingEl.value = damping; iterEl.value = iter; tearEl.value = tearFactor;
+
+function applyUI(){ rows = parseInt(rowsEl.value); cols = parseInt(colsEl.value); spacing = parseInt(spacingEl.value);
+ gravity = parseFloat(gravityEl.value); damping = parseFloat(dampingEl.value); iter = parseInt(iterEl.value); tearFactor = parseFloat(tearEl.value);
+ // update existing sticks tear
+ sticks.forEach(s=>s.tear = tearFactor);
+}
+
+[rowsEl,colsEl,spacingEl,gravityEl,dampingEl,iterEl,tearEl].forEach(el=>el.addEventListener('input',()=>{
+  applyUI();
+}));
+
+resetBtn.addEventListener('click',()=>{const f = fileInput.files[0]; if(f){ const reader = new FileReader(); reader.onload = ()=>{ try{ const data = JSON.parse(reader.result); rows=data.rows; cols=data.cols; spacing=data.spacing; points=[]; sticks=[]; for(const pp of data.points){ const p=new Point(pp.x,pp.y); p.pinned=!!pp.pinned; p.h = pp.h||Math.random()*360; points.push(p); } for(const s of data.sticks){ sticks.push(new Stick(points[s.a], points[s.b], s.len || Math.hypot(points[s.a].x-points[s.b].x, points[s.a].y-points[s.b].y))); } rowsEl.value=rows; colsEl.value=cols; spacingEl.value=spacing; }catch(err){ alert('שגיאה בקובץ'); } } ; reader.readAsText(f);} else { buildGrid(parseInt(rowsEl.value),parseInt(colsEl.value),parseInt(spacingEl.value));} });
+pinAllBtn.addEventListener('click',()=>{ for(let i=0;i<cols;i++) points[i].pinned=true; });
+unpinAllBtn.addEventListener('click',()=>{ points.forEach(p=>p.pinned=false); });
+
+toggleBtn.addEventListener('click',()=>{ running = !running; toggleBtn.textContent = running? 'Pause' : 'Resume'; });
+
+// mouse interaction
+let pointer = {x:0,y:0,down:false,lastX:0,lastY:0};
+let grabbed = null; // index of grabbed point
+canvas.addEventListener('pointerdown', (e)=>{
+  canvas.setPointerCapture(e.pointerId);
+  pointer.down = true; pointer.lastX = e.clientX; pointer.lastY = e.clientY;
+  const r = canvas.getBoundingClientRect();
+  const mx = (e.clientX - r.left) * (canvas.width/canvas.clientWidth) / DPR;
+  const my = (e.clientY - r.top) * (canvas.height/canvas.clientHeight) / DPR;
+  pointer.x = mx; pointer.y = my;
+  // find nearest point within threshold
+  let best = -1; let bestDist = 9999; for(let i=0;i<points.length;i++){
+    const p = points[i]; const d = Math.hypot(p.x-mx,p.y-my);
+    if(d < bestDist && d < spacing*0.9){ bestDist = d; best = i; }
+  }
+  if(best >= 0){ grabbed = points[best]; // optionally pin/unpin on ctrl
+    if(e.ctrlKey || e.metaKey){ grabbed.pinned = !grabbed.pinned; }
+  } else {
+    grabbed = null;
+  }
+  const found = findNearest(mx,my, spacing*0.9);
+  if(mode==='add'){ const p=new Point(mx,my); points.push(p); return; }
+  if(mode==='connect'){ if(!connectFrom && found) connectFrom = found; else if(connectFrom && found && connectFrom!==found){ sticks.push(new Stick(connectFrom, found, tearFactor)); connectFrom=null; } return; }
+  if(mode==='delete'){ if(found){ // remove point and related sticks
+    sticks = sticks.filter(s=> s.a!==found && s.b!==found); points.splice(points.indexOf(found),1); }
+    return; }
+});
+canvas.addEventListener('pointermove', (e)=>{
+  const r = canvas.getBoundingClientRect();
+  const mx = (e.clientX - r.left) * (canvas.width/canvas.clientWidth) / DPR;
+  const my = (e.clientY - r.top) * (canvas.height/canvas.clientHeight) / DPR;
+  pointer.x = mx; pointer.y = my;
+  if(pointer.down && grabbed){ // drag
+    // simple move: set position directly, velocity stored via previous positions
+    grabbed.x = mx; grabbed.y = my;
+  }
+});
+canvas.addEventListener('pointerup', (e)=>{ pointer.down=false; grabbed=null; try{ canvas.releasePointerCapture(e.pointerId); }catch(e){} });
+
+// main loop
+let last = performance.now();
+function step(now){ const dt = Math.min(0.032, (now-last)/1000); last = now; applyUI();
+  if(running){
+    // apply gravity
+    for(const p of points){ p.applyForce(0, gravity * 80); }
+    // verlet integrate
+    for(const p of points){ p.verlet(dt, damping); }
+    // satisfy constraints multiple times
+    for(let k=0;k<iter;k++){
+      for(const s of sticks) s.satisfy();
+      // boundary collisions
+      for(const p of points){ if(p.x < 10) p.x = 10; if(p.x > canvas.width/DPR - 10) p.x = canvas.width/DPR - 10; if(p.y < 10) p.y = 10; if(p.y > canvas.height/DPR - 10) p.y = canvas.height/DPR - 10; }
+    }
+  }
+  render();
+  requestAnimationFrame(step);
+}
+requestAnimationFrame(step);
+function render() {
+  ctx.clearRect(0,0,canvas.width/DPR,canvas.height/DPR);
+  const threshold = spacing * 1.5;
+
+  if(renderMode === 'normal') {
+  // draw sticks
+  ctx.lineWidth = 1.2; ctx.strokeStyle = 'rgba(127,179,255,0.85)';
+  ctx.beginPath();
+  for(const s of sticks){ if(s.broken) continue; ctx.moveTo(s.a.x, s.a.y); ctx.lineTo(s.b.x, s.b.y); }
+  ctx.stroke();
+
+  // draw points
+  for(const p of points){ ctx.beginPath(); ctx.arc(p.x,p.y,2.6,0,Math.PI*2); ctx.fillStyle = p.pinned? 'rgba(255,211,107,0.98)' : 'rgba(223,243,255,0.95)'; ctx.fill(); }
+
+  // draw hovered / grabbed highlight
+  if(pointer.x && pointer.y){ ctx.beginPath(); ctx.arc(pointer.x, pointer.y, 14,0,Math.PI*2); ctx.strokeStyle='rgba(255,255,255,0.04)'; ctx.lineWidth=1; ctx.stroke(); }
+
+  // debug: draw count
+  ctx.fillStyle = 'rgba(200,220,255,0.6)'; ctx.font = '12px system-ui'; ctx.fillText(`points: ${points.length} sticks: ${sticks.length}`, 12, 18);
+
+  } else if(renderMode === 'delaunay') {
+  const threshold = spacing * 1.5;
+
+  if(points.length < 3) return; // לפחות 3 נקודות לטריאנגולציה
+
+  // Delaunay triangulation
+  const delaunay = d3.Delaunay.from(points, p => p.x, p => p.y);
+  const triangles = delaunay.triangles; // Uint32Array [i0,i1,i2, i3,i4,i5,...]
+
+  for(let i=0; i<triangles.length; i+=3){
+    const a=points[triangles[i]];
+    const b=points[triangles[i+1]];
+    const c=points[triangles[i+2]];
+
+    // צבע משולש עם שינוי עדין בגוון
+    const cx=(a.x+b.x+c.x)/3, cy=(a.y+b.y+c.y)/3;
+    const gradient=ctx.createLinearGradient(a.x,a.y,c.x,c.y);
+    gradient.addColorStop(0, `hsl(${(cx+cy)%360},50%,40%)`);
+    gradient.addColorStop(1, `hsl(${(cx+cy+20)%360},55%,45%)`);
+    ctx.fillStyle=gradient;
+    ctx.beginPath();
+    ctx.moveTo(a.x,a.y);
+    ctx.lineTo(b.x,b.y);
+    ctx.lineTo(c.x,c.y);
+    ctx.closePath();
+    ctx.fill();
+
+    // ציור נקודות אם העכבר קרוב
+    if(Math.hypot(pointer.x-cx,pointer.y-cy)<threshold){
+      [a,b,c].forEach(p=>{
+        ctx.beginPath();
+        ctx.arc(p.x,p.y,3,0,Math.PI*2);
+        ctx.fillStyle=p.pinned?'#ffd36b':'#dff3ff';
+        ctx.fill();
+      });
+    }
+  }
+  } else if(renderMode === 'polygon') {
+	  ctx.clearRect(0,0,canvas.width/DPR,canvas.height/DPR);
+	  const threshold = spacing * 1.5;
+	  for(let y=0;y<rows-1;y++){
+		for(let x=0;x<cols-1;x++){
+		  const a=points[y*cols+x], b=points[y*cols+x+1], c=points[(y+1)*cols+x], d=points[(y+1)*cols+x+1];
+		  if(!a || !b || !c || !d) continue; // <<< בדיקה חשובה
+		  const gradient=ctx.createLinearGradient(a.x,a.y,d.x,d.y);
+		  gradient.addColorStop(0, `hsl(${(a.x+a.y)%360},50%,40%)`);
+		  gradient.addColorStop(1, `hsl(${(d.x+d.y)%360},55%,45%)`);
+		  ctx.fillStyle=gradient;
+		  ctx.beginPath();
+		  ctx.moveTo(a.x,a.y);
+		  ctx.lineTo(b.x,b.y);
+		  ctx.lineTo(d.x,d.y);
+		  ctx.lineTo(c.x,c.y);
+		  ctx.closePath();
+		  ctx.fill();
+		  const cx=(a.x+b.x+c.x+d.x)/4, cy=(a.y+b.y+c.y+d.y)/4;
+		  if(Math.hypot(pointer.x-cx,pointer.y-cy)<threshold){
+			[a,b,c,d].forEach(p=>{
+			  ctx.beginPath();
+			  ctx.arc(p.x,p.y,3,0,Math.PI*2);
+			  ctx.fillStyle = p.pinned ? '#ffd36b' : '#dff3ff';
+			  ctx.fill();
+			});
+		  }
+		}
+	  }
+  }
+}// initial resize handle to recalc offsets
+setTimeout(()=>{ resizeCanvas(); buildGrid(rows,cols,spacing); },100);
+document.getElementById('save').addEventListener('click', ()=>{
+  const data = {rows,cols,spacing,points:points.map(p=>({x:p.x,y:p.y,pinned:p.pinned,h:p.h})),sticks:sticks.map(s=>({a:points.indexOf(s.a),b:points.indexOf(s.b),len:s.length}))};
+  const blob = new Blob([JSON.stringify(data)], {type:'application/json'});
+  const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href=url; a.download='grid.json'; a.click(); URL.revokeObjectURL(url);
+});
+
+fileInput.addEventListener('change', ()=>{
+  const f = fileInput.files[0]; if(!f) return; const reader = new FileReader(); reader.onload = ()=>{ try{ const data = JSON.parse(reader.result); rows=data.rows; cols=data.cols; spacing=data.spacing; points=[]; sticks=[]; for(const pp of data.points){ const p=new Point(pp.x,pp.y); p.pinned=!!pp.pinned; p.h = pp.h||Math.random()*360; points.push(p); } for(const s of data.sticks){ sticks.push(new Stick(points[s.a], points[s.b], s.len || Math.hypot(points[s.a].x-points[s.b].x, points[s.a].y-points[s.b].y))); } rowsEl.value=rows; colsEl.value=cols; spacingEl.value=spacing; }catch(err){ alert('שגיאה בקובץ'); } } ; reader.readAsText(f);
+});
+
+window.addEventListener('keydown',(e)=>{
+  if(e.code==='Space'){ setMode('drag'); e.preventDefault(); }
+  if(e.key.toLowerCase()==='a'){ setMode('add'); }
+  if(e.key.toLowerCase()==='c'){ setMode('connect'); }
+  if(e.key.toLowerCase()==='d'){ setMode('delete'); }
+});
+</script>
+</body>
+</html>
